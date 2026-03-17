@@ -1,0 +1,39 @@
+name: Weekly India Funding Scraper
+
+on:
+  schedule:
+    - cron: '30 0 * * 1'   # Every Monday at 6:00 AM IST (00:30 UTC)
+  workflow_dispatch:         # Allow manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # Needed to commit the CSV back to repo
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: python scraper/run.py
+
+      - name: Commit and push updated CSV
+        run: |
+          git config user.name  "funding-bot"
+          git config user.email "funding-bot@users.noreply.github.com"
+          git add data/india_funding.csv
+          git diff --staged --quiet \
+            && echo "No new data this week" \
+            || (git commit -m "chore: weekly funding update $(date +%Y-%m-%d)" && git push)
