@@ -1,5 +1,4 @@
 requests==2.31.0
 beautifulsoup4==4.12.3
 pandas==2.2.2
-openai==1.35.0
 lxml==5.2.2
