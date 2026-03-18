@@ -1,8 +1,10 @@
-# 🇮🇳 India Startup Funding Tracker
+# 🇮🇳 India EdTech Investor Finder
 
-A free, automated weekly scraper that collects Indian startup funding data — investor names, domains, funding rounds, and ticket sizes — and saves everything to a public CSV. No paid subscriptions needed.
+A free, automated weekly scraper that collects Indian startup funding data from public sources, filters for EdTech deals, and cross-references investors against the SEBI AIF registry to surface contact details — all saved to public CSVs. No paid subscriptions needed.
 
 ## What's tracked
+
+### Full funding data (`data/india_funding_<year>.csv`)
 
 | Column | Description |
 |---|---|
@@ -11,9 +13,25 @@ A free, automated weekly scraper that collects Indian startup funding data — i
 | `round` | Funding stage (Seed, Series A, Series B, Angel …) |
 | `amount_usd` | Ticket size in USD (null if undisclosed) |
 | `investor` | Investor name (one row per investor per deal) |
+| `headquarters` | City / state where the startup is based |
 | `date` | Date of funding announcement |
-| `source` | Which site the data came from |
 | `scraped_at` | Date this row was collected |
+
+### EdTech investor contacts (`data/edtech_investors.csv`)
+
+| Column | Description |
+|---|---|
+| `investor` | Investor name |
+| `investor_email` | Contact email from SEBI AIF registry (if matched) |
+| `sebi_reg_no` | SEBI AIF registration number (if matched) |
+| `aif_category` | AIF category (Category I / II / III) |
+| `investor_city` | City from SEBI registry |
+| `startup_name` | Name of the EdTech startup funded |
+| `domain` | EdTech sub-sector |
+| `round` | Funding stage |
+| `amount_usd` | Ticket size in USD |
+| `headquarters` | Startup headquarters |
+| `date` | Date of funding announcement |
 
 ## Data sources
 
@@ -22,38 +40,44 @@ A free, automated weekly scraper that collects Indian startup funding data — i
 | StartupTalky 2026 | [link](https://startuptalky.com/indian-startups-funding-investors-data-2026/) | HTML table |
 | StartupTalky 2025 | [link](https://startuptalky.com/indian-startups-funding-investors-data-2025/) | HTML table |
 | StartupTalky 2024 | [link](https://startuptalky.com/indian-startups-funding-investor-data-2024/) | HTML table |
-| Inc42 weekly | [link](https://inc42.com/tag/funding-galore/) | Kimi AI extract |
-| Entrackr news | [link](https://entrackr.com/news/) | Kimi AI extract |
+| SEBI AIF Registry | [link](https://www.sebi.gov.in/sebiweb/other/OtherAction.do?doRecognisedFpi=yes&intmId=16) | HTML scrape |
 
 ## How it works
 
 1. **Every Monday at 6:00 AM IST** a GitHub Actions workflow runs `scraper/run.py`
-2. StartupTalky tables are parsed directly (no AI needed)
-3. Inc42 and Entrackr articles are fetched and sent to [Kimi API](https://platform.moonshot.cn/) (moonshot-v1-8k) for structured extraction
-4. New rows are appended to `data/india_funding.csv`, deduplicated, and committed back to the repo
+2. StartupTalky tables (2024, 2025, 2026) are scraped and parsed into structured rows
+3. Rows matching EdTech keywords are filtered into a separate dataset
+4. The SEBI AIF registry is scraped to collect fund names, registration numbers, categories, contact emails, and cities
+5. EdTech investors are fuzzy-matched against SEBI fund names (≥ 50% token overlap) to enrich with contact details
+6. All CSVs are deduplicated and committed back to the repo
+
+## Output files
+
+| File | Description |
+|---|---|
+| `data/india_funding_2024.csv` | All startup funding deals scraped for 2024 |
+| `data/india_funding_2025.csv` | All startup funding deals scraped for 2025 |
+| `data/india_funding_2026.csv` | All startup funding deals scraped for 2026 |
+| `data/edtech_investors.csv` | EdTech-only investors enriched with SEBI AIF contact data |
 
 ## Setup (for your own fork)
 
 ### 1. Fork this repo
 
-### 2. Add your Kimi API key as a secret
-Go to `Settings → Secrets and variables → Actions → New repository secret`
-- Name: `KIMI_API_KEY`
-- Value: your key from [platform.moonshot.cn](https://platform.moonshot.cn/)
-
-### 3. Enable GitHub Actions
+### 2. Enable GitHub Actions
 Go to the `Actions` tab and click **Enable workflows**
 
-### 4. Run manually to test
+### 3. Run manually to test
 Go to `Actions → Weekly India Funding Scraper → Run workflow`
+
+No API keys or secrets required — all data sources are publicly accessible.
 
 ## Run locally
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/india-funding-tracker
-cd india-funding-tracker
+git clone https://github.com/YOUR_USERNAME/InvestorFinder
+cd InvestorFinder
 pip install -r requirements.txt
-export KIMI_API_KEY=your_key_here
 python scraper/run.py
 ```
 
@@ -62,19 +86,15 @@ python scraper/run.py
 | Component | Cost |
 |---|---|
 | GitHub Actions | Free (2000 min/month) |
-| Kimi API (~200 articles/week) | ~₹15–20/week |
 | Everything else | ₹0 |
 
 ## CSV download
 
-The latest data is always at:
-```
-data/india_funding.csv
-```
+The latest data is always available in the `data/` folder. Direct raw links:
 
-Direct raw link (once hosted):
 ```
-https://raw.githubusercontent.com/YOUR_USERNAME/india-funding-tracker/main/data/india_funding.csv
+https://raw.githubusercontent.com/YOUR_USERNAME/InvestorFinder/main/data/india_funding_2026.csv
+https://raw.githubusercontent.com/YOUR_USERNAME/InvestorFinder/main/data/edtech_investors.csv
 ```
 
 ## License
