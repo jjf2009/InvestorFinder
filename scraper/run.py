@@ -1,29 +1,22 @@
 """
 India Startup Funding Scraper
-Sources: StartupTalky (2024/2025/2026), Inc42, Entrackr
-AI:      Google Gemini 2.5 Flash (free tier — 10 RPM, 250 RPD)
-Output:  data/india_funding.csv
+Source:  StartupTalky only (clean HTML tables, no AI needed)
+Output:  data/india_funding_2024.csv
+         data/india_funding_2025.csv
+         data/india_funding_2026.csv
 """
 
 import os
 import re
-import json
 import time
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, UTC
 from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
-def _get_key(): return os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL   = "gemini-2.5-flash"
-GEMINI_URL     = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={{key}}"
-)
 
 HEADERS = {
     "User-Agent": (
@@ -33,93 +26,7 @@ HEADERS = {
     )
 }
 
-OUTPUT_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "india_funding.csv")
-
-# ─── Gemini API ───────────────────────────────────────────────────────────────
-
-EXTRACT_PROMPT = """
-You are extracting Indian startup funding deals from news article text.
-Extract EVERY funding deal mentioned. Return ONLY a valid JSON array — no explanation, no markdown, no backticks.
-
-For each deal extract:
-- startup_name: company name (string)
-- domain: the sector/industry (e.g. "EdTech", "FinTech", "HealthTech", "AgriTech", "SaaS")
-- round: funding stage (e.g. "Seed", "Pre-Seed", "Series A", "Series B", "Angel", "Debt")
-- amount_usd: amount in USD as a plain number, null if undisclosed
-- investors: array of investor name strings — split multiple investors into separate items
-- date: date string YYYY-MM-DD if mentioned, else null
-
-Conversion rules:
-- INR crores to USD: divide by 84, then multiply by 10,000,000 (e.g. ₹10 Cr = ~$119,048)
-- $1 Mn = 1,000,000 | $1 Bn = 1,000,000,000
-- "undisclosed" → null
-
-Return ONLY a JSON array. If no deals found return [].
-Example: [{{"startup_name":"Acme","domain":"FinTech","round":"Seed","amount_usd":500000,"investors":["Sequoia"],"date":"2026-03-10"}}]
-
-Article text:
-{article_text}
-"""
-
-def gemini_extract(article_text: str) -> list:
-    GEMINI_API_KEY = _get_key()
-    if not GEMINI_API_KEY:
-        log.warning("No GEMINI_API_KEY — skipping AI extraction")
-        return []
-    try:
-        resp = requests.post(
-            GEMINI_URL.format(key=GEMINI_API_KEY),  # uses local var from line above
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": EXTRACT_PROMPT.format(
-                    article_text=article_text[:6000]
-                )}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        # Strip markdown fences Gemini sometimes adds
-        raw = re.sub(r"^```[a-z]*\s*", "", raw, flags=re.MULTILINE)
-        raw = raw.strip().rstrip("`").strip()
-
-        parsed = json.loads(raw)
-
-        # Gemini sometimes returns a dict instead of array — normalise both
-        if isinstance(parsed, dict):
-            # e.g. {"deals": [...]} or a single deal object
-            if "deals" in parsed:
-                parsed = parsed["deals"]
-            elif "startup_name" in parsed:
-                parsed = [parsed]
-            else:
-                # Try to find any list value
-                for v in parsed.values():
-                    if isinstance(v, list):
-                        parsed = v
-                        break
-                else:
-                    parsed = []
-
-        return parsed if isinstance(parsed, list) else []
-
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
-            log.warning("Gemini rate limit — sleeping 65s and retrying once")
-            time.sleep(65)
-            return gemini_extract(article_text)
-        log.error(f"Gemini HTTP error: {e}")
-        return []
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        log.error(f"Gemini parse error: {e} | raw snippet: {raw[:200] if 'raw' in dir() else 'N/A'}")
-        return []
-    except Exception as e:
-        log.error(f"Gemini extraction failed: {e}")
-        return []
-
-
-# ─── SCRAPER 1: StartupTalky ──────────────────────────────────────────────────
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
 STARTUPTALKY_URLS = {
     "2024": "https://startuptalky.com/indian-startups-funding-investor-data-2024/",
@@ -127,337 +34,270 @@ STARTUPTALKY_URLS = {
     "2026": "https://startuptalky.com/indian-startups-funding-investors-data-2026/",
 }
 
-def scrape_startuptalky() -> list:
-    rows = []
-    for year, url in STARTUPTALKY_URLS.items():
-        log.info(f"StartupTalky {year}: {url}")
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            tables = soup.find_all("table")
-            log.info(f"  Found {len(tables)} tables")
-            for table in tables:
-                ths = [th.get_text(strip=True) for th in table.find_all("th")]
-                col_map = _map_startuptalky_cols(ths)
-                if not col_map:
-                    continue
-                for tr in table.find_all("tr")[1:]:
-                    tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                    if len(tds) < 3:
-                        continue
-                    row = _extract_startuptalky_row(tds, col_map)
-                    if row:
-                        row["source"] = f"startuptalky_{year}"
-                        for inv in _split_investors(row.pop("investors_raw", "")):
-                            rows.append({**row, "investor": inv})
-        except Exception as e:
-            log.error(f"StartupTalky {year} failed: {e}")
-        time.sleep(2)
-    log.info(f"StartupTalky total rows: {len(rows)}")
-    return rows
+# Canonical column names in final CSV
+FINAL_COLS = [
+    "startup_name",
+    "domain",
+    "round",
+    "amount_usd",
+    "investor",
+    "headquarters",
+    "date",
+    "scraped_at",
+]
+
+# ─── Scraper ──────────────────────────────────────────────────────────────────
+
+def scrape_year(year: str, url: str) -> pd.DataFrame:
+    log.info(f"Scraping {year}: {url}")
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        log.error(f"  Failed to fetch {year}: {e}")
+        return pd.DataFrame()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    tables = soup.find_all("table")
+    log.info(f"  Found {len(tables)} tables")
+
+    all_rows = []
+    for table in tables:
+        ths = [th.get_text(strip=True) for th in table.find_all("th")]
+        col_map = _map_columns(ths)
+        if not col_map:
+            continue
+        for tr in table.find_all("tr")[1:]:
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(tds) < 3:
+                continue
+            row = _parse_row(tds, col_map)
+            if row:
+                # One row per investor (explode multi-investor cells)
+                for inv in _split_investors(row.pop("investors_raw", "")):
+                    all_rows.append({**row, "investor": inv})
+
+    if not all_rows:
+        log.warning(f"  No rows parsed for {year}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    log.info(f"  Raw rows (before cleaning): {len(df)}")
+    return df
 
 
-def _map_startuptalky_cols(headers: list) -> dict:
+def _map_columns(headers: list) -> dict:
+    """Map raw table header names to canonical keys."""
     mapping = {}
     for i, h in enumerate(headers):
-        hl = h.lower()
-        if "company" in hl or "startup" in hl:
+        hl = h.lower().strip()
+        if any(k in hl for k in ("company", "startup")):
             mapping["startup_name"] = i
-        elif "sector" in hl or "industry" in hl or "vertical" in hl:
+        elif any(k in hl for k in ("sector", "industry", "vertical", "domain")):
             mapping["domain"] = i
-        elif ("amount" in hl or "raised" in hl) and "round" not in hl:
-            mapping["amount_usd"] = i
-        elif "round" in hl or "stage" in hl or "type" in hl:
+        elif any(k in hl for k in ("headquarter", "location", "city", "state")):
+            mapping["headquarters"] = i
+        elif ("amount" in hl or "raised" in hl or "funding" in hl) and "round" not in hl and "type" not in hl:
+            mapping["amount_raw"] = i
+        elif any(k in hl for k in ("round", "stage", "type")):
             mapping["round"] = i
-        elif "investor" in hl or "lead" in hl:
+        elif any(k in hl for k in ("investor", "lead")):
             mapping["investors_raw"] = i
         elif "date" in hl:
             mapping["date"] = i
     return mapping if "startup_name" in mapping else {}
 
 
-def _extract_startuptalky_row(tds: list, col_map: dict):
+def _parse_row(tds: list, col_map: dict) -> dict | None:
     def g(key):
         idx = col_map.get(key)
         return tds[idx].strip() if idx is not None and idx < len(tds) else ""
+
     startup = g("startup_name")
-    if not startup or startup.lower() in ("company", "startup", "—", "-", ""):
+    if not startup or startup.lower() in ("company", "startup", "name", "—", "-", ""):
         return None
+
     return {
-        "startup_name": startup,
+        "startup_name":  startup,
         "domain":        g("domain"),
         "round":         g("round"),
-        "amount_usd":    _parse_amount(g("amount_usd")),
+        "amount_usd":    _parse_amount(g("amount_raw")),
+        "headquarters":  g("headquarters"),
         "investors_raw": g("investors_raw"),
         "date":          g("date"),
     }
 
 
-# ─── SCRAPER 2: Inc42 ─────────────────────────────────────────────────────────
-# Inc42's tag page is JS-rendered — BS can't list articles from it.
-# Strategy: build article URLs directly using their known slug pattern,
-# verified via Google search: inc42.com/buzz/funding-galore-* and
-# inc42.com/buzz/*weekly-funding-*
-# We generate candidate URLs for the last 8 weeks and probe which exist.
+# ─── Cleaning ─────────────────────────────────────────────────────────────────
 
-def _inc42_candidate_urls() -> list:
-    """
-    Generate likely Inc42 weekly funding URLs for the past 8 weeks.
-    Pattern 1: /buzz/funding-galore-<week-date-range>/
-    Pattern 2: /buzz/<topic>-weekly-funding-rundown-<more>/
-    We probe both and keep the ones that return 200.
-    """
-    urls = []
-    today = datetime.utcnow()
-    for weeks_back in range(0, 8):
-        week_end = today - timedelta(weeks=weeks_back)
-        week_start = week_end - timedelta(days=6)
-        # Format: "14-march-2026" style used in Inc42 slugs
-        end_str   = week_end.strftime("%-d-%B-%Y").lower()
-        start_str = week_start.strftime("%-d-%B-%Y").lower()
-        # Also try month-number style
-        end_str2   = week_end.strftime("%-d-%b-%Y").lower()
-        start_str2 = week_start.strftime("%-d-%b-%Y").lower()
+def clean(df: pd.DataFrame, year: str) -> pd.DataFrame:
+    if df.empty:
+        return df
 
-        candidates = [
-            f"https://inc42.com/buzz/funding-galore-{start_str}-{end_str}/",
-            f"https://inc42.com/buzz/funding-galore-indian-startup-funding-{start_str}-{end_str}/",
-            f"https://inc42.com/buzz/funding-galore-{start_str2}-{end_str2}/",
-        ]
-        urls.extend(candidates)
-    return urls
+    df = df.copy()
 
+    # ── 1. Normalise text columns ──────────────────────────────────────────────
+    for col in ["startup_name", "domain", "round", "investor", "headquarters", "date"]:
+        if col in df.columns:
+            df[col] = (df[col]
+                       .astype(str)
+                       .str.strip()
+                       .str.replace(r"\s+", " ", regex=True))   # collapse internal spaces
 
-def scrape_inc42() -> list:
-    rows = []
-    log.info("Inc42: probing weekly funding article URLs")
-    candidates = _inc42_candidate_urls()
-    found = []
+    # ── 2. Drop clearly empty / header rows ───────────────────────────────────
+    junk = {"", "nan", "none", "—", "-", "n/a", "na", "company", "startup", "name"}
+    df = df[~df["startup_name"].str.lower().isin(junk)]
 
-    for url in candidates:
-        try:
-            r = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
-            if r.status_code == 200:
-                found.append(url)
-                log.info(f"  Inc42 URL found: {url}")
-            time.sleep(1)
-        except Exception:
-            pass
+    # ── 3. Clean startup_name ─────────────────────────────────────────────────
+    # Remove trailing punctuation, superscripts, footnote markers
+    df["startup_name"] = df["startup_name"].str.replace(r"[\*†‡§#]+$", "", regex=True).str.strip()
 
-    # Fallback: if no URLs found via probing, try scraping inc42.com/buzz/ directly
-    if not found:
-        log.info("Inc42: probing failed, trying /buzz/ listing page")
-        found = _scrape_inc42_buzz_listing()
+    # ── 4. Normalise domain ───────────────────────────────────────────────────
+    # Collapse minor variants: "Ed Tech" → "EdTech", "Fin Tech" → "FinTech" etc.
+    domain_fixes = {
+        r"\bEd[\s\-]?[Tt]ech\b":     "EdTech",
+        r"\bFin[\s\-]?[Tt]ech\b":    "FinTech",
+        r"\bHealth[\s\-]?[Tt]ech\b": "HealthTech",
+        r"\bAgri[\s\-]?[Tt]ech\b":   "AgriTech",
+        r"\bHR[\s\-]?[Tt]ech\b":     "HRTech",
+        r"\bProp[\s\-]?[Tt]ech\b":   "PropTech",
+        r"\bLegal[\s\-]?[Tt]ech\b":  "LegalTech",
+        r"\bClean[\s\-]?[Tt]ech\b":  "CleanTech",
+        r"\bRe[\s\-]?[Tt]ech\b":     "RetailTech",
+    }
+    for pattern, replacement in domain_fixes.items():
+        df["domain"] = df["domain"].str.replace(pattern, replacement, regex=True)
 
-    log.info(f"Inc42: scraping {len(found)} articles")
-    for url in found[:6]:
-        rows.extend(_fetch_and_extract(url, source="inc42"))
-        time.sleep(7)   # stay under 10 RPM Gemini limit
+    # ── 5. Normalise round ────────────────────────────────────────────────────
+    round_fixes = {
+        r"(?i)^pre[\s\-]?seed$":          "Pre-Seed",
+        r"(?i)^seed$":                     "Seed",
+        r"(?i)^series[\s\-]?a$":          "Series A",
+        r"(?i)^series[\s\-]?b$":          "Series B",
+        r"(?i)^series[\s\-]?c$":          "Series C",
+        r"(?i)^series[\s\-]?d$":          "Series D",
+        r"(?i)^series[\s\-]?e$":          "Series E",
+        r"(?i)^series[\s\-]?f$":          "Series F",
+        r"(?i)^angel$":                    "Angel",
+        r"(?i)^(conventional[\s\-]?)?debt$": "Debt",
+        r"(?i)^(private[\s\-]?equity|pe)$":  "PE",
+        r"(?i)^post[\s\-]?ipo$":          "Post-IPO",
+        r"(?i)^grant$":                    "Grant",
+        r"(?i)^bridge$":                   "Bridge",
+    }
+    for pattern, replacement in round_fixes.items():
+        mask = df["round"].str.match(pattern, na=False)
+        df.loc[mask, "round"] = replacement
 
-    log.info(f"Inc42 total rows: {len(rows)}")
-    return rows
+    # ── 6. Clean investor ─────────────────────────────────────────────────────
+    df["investor"] = df["investor"].str.replace(r"[\*†‡§#]+$", "", regex=True).str.strip()
+    # Replace empty/undisclosed with a consistent value
+    df["investor"] = df["investor"].replace(
+        to_replace=["", "nan", "none", "—", "-", "n/a", "undisclosed"],
+        value="Undisclosed"
+    )
 
+    # ── 7. Drop rows where amount_usd is 0 ────────────────────────────────────
+    if "amount_usd" in df.columns:
+        df["amount_usd"] = pd.to_numeric(df["amount_usd"], errors="coerce")
+        df.loc[df["amount_usd"] == 0, "amount_usd"] = None
 
-def _scrape_inc42_buzz_listing() -> list:
-    """Scrape inc42.com/buzz/ for links containing 'funding' in href or text."""
-    found = []
-    try:
-        resp = requests.get("https://inc42.com/buzz/", headers=HEADERS, timeout=20)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            text = a.get_text(strip=True).lower()
-            if (
-                "inc42.com/buzz/" in href
-                and any(kw in href + text for kw in ["funding-galore", "funding-rundown", "weekly-funding"])
-                and href not in found
-            ):
-                found.append(href)
-        log.info(f"  Inc42 /buzz/ listing: found {len(found)} links")
-    except Exception as e:
-        log.error(f"Inc42 /buzz/ listing failed: {e}")
-    return found[:6]
+    # ── 8. Add metadata ───────────────────────────────────────────────────────
+    df["scraped_at"] = datetime.now(UTC).strftime("%Y-%m-%d")
 
+    # ── 9. Enforce final column order (add missing cols as empty) ─────────────
+    for col in FINAL_COLS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[FINAL_COLS]
 
-# ─── SCRAPER 3: Entrackr ──────────────────────────────────────────────────────
-# Entrackr's /news/ page uses a different structure — articles are in <h2>/<h3>
-# tags inside card divs, not plain <a> tags with funding keywords in link text.
+    # ── 10. Deduplicate ───────────────────────────────────────────────────────
+    before = len(df)
+    df = df.drop_duplicates(subset=["startup_name", "investor", "round"], keep="last")
+    dupes_removed = before - len(df)
+    if dupes_removed:
+        log.info(f"  Removed {dupes_removed} duplicate rows")
 
-def scrape_entrackr(max_articles: int = 8) -> list:
-    rows = []
-    log.info("Entrackr: scraping news listing")
-    try:
-        resp = requests.get("https://entrackr.com/news/", headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        funding_keywords = {"funding", "raises", "raised", "secures", "secured",
-                            "investment", "round", "crore", "mn", "million"}
-        found = []
-
-        # Strategy 1: any <a> whose href is an entrackr article path
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            # Normalise relative URLs
-            if href.startswith("/"):
-                href = "https://entrackr.com" + href
-            if "entrackr.com" not in href:
-                continue
-            combined_text = (a.get_text(strip=True) + " " + href).lower()
-            if any(kw in combined_text for kw in funding_keywords):
-                if href not in found:
-                    found.append(href)
-
-        # Strategy 2: grab ALL internal article links and let Gemini filter
-        if len(found) < 3:
-            log.info("  Entrackr: few keyword matches, widening to all article links")
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if href.startswith("/"):
-                    href = "https://entrackr.com" + href
-                if (
-                    "entrackr.com" in href
-                    and len(href) > 30           # skip homepage/category pages
-                    and href not in found
-                    and not href.endswith("/news/")
-                    and not href.endswith("/entrackr.com/")
-                ):
-                    found.append(href)
-
-        found = list(dict.fromkeys(found))[:max_articles]
-        log.info(f"  Entrackr: scraping {len(found)} articles")
-
-        for url in found:
-            rows.extend(_fetch_and_extract(url, source="entrackr"))
-            time.sleep(7)
-
-    except Exception as e:
-        log.error(f"Entrackr scraper failed: {e}")
-
-    log.info(f"Entrackr total rows: {len(rows)}")
-    return rows
+    df = df.sort_values(["domain", "startup_name", "investor"]).reset_index(drop=True)
+    log.info(f"  Clean rows for {year}: {len(df)}")
+    return df
 
 
-# ─── Shared: fetch article text + Gemini extract ──────────────────────────────
+# ─── Merge with existing CSV ──────────────────────────────────────────────────
 
-def _fetch_and_extract(url: str, source: str) -> list:
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+def merge_with_existing(new_df: pd.DataFrame, csv_path: str) -> pd.DataFrame:
+    """Append new rows to existing CSV, then dedup the combined set."""
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 50:
+        existing = pd.read_csv(csv_path, dtype=str).fillna("")
+        log.info(f"  Existing rows in CSV: {len(existing)}")
+        combined = pd.concat([existing, new_df.fillna("")], ignore_index=True)
+    else:
+        combined = new_df.fillna("")
 
-        # Remove nav, footer, sidebar noise
-        for tag in soup(["nav", "footer", "header", "script", "style", "aside"]):
-            tag.decompose()
-
-        article = (
-            soup.find("article")
-            or soup.find("div", class_=re.compile(r"\b(content|post-body|entry|article)\b", re.I))
-            or soup.find("main")
-        )
-        text = article.get_text("\n", strip=True) if article else soup.get_text("\n", strip=True)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-
-        rows = []
-        for deal in gemini_extract(text):
-            if not isinstance(deal, dict):
-                continue
-            for inv in _split_investors(",".join(
-                deal.get("investors") or []
-                if isinstance(deal.get("investors"), list)
-                else [str(deal.get("investors", ""))]
-            )):
-                rows.append({
-                    "startup_name": str(deal.get("startup_name", "")).strip(),
-                    "domain":       str(deal.get("domain", "")).strip(),
-                    "round":        str(deal.get("round", "")).strip(),
-                    "amount_usd":   deal.get("amount_usd"),
-                    "investor":     inv,
-                    "date":         str(deal.get("date", "")).strip(),
-                    "source":       source,
-                })
-        log.info(f"  {source}: {url} → {len(rows)} rows")
-        return rows
-    except Exception as e:
-        log.error(f"  {source}: failed {url}: {e}")
-        return []
+    before = len(combined)
+    combined = combined.drop_duplicates(subset=["startup_name", "investor", "round"], keep="last")
+    log.info(f"  After merge dedup: {before} → {len(combined)} rows")
+    return combined.sort_values(["domain", "startup_name"]).reset_index(drop=True)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _parse_amount(raw: str):
-    if not raw or raw.lower() in ("undisclosed", "—", "-", "n/a", ""):
+    if not raw or raw.lower() in ("undisclosed", "—", "-", "n/a", "na", ""):
         return None
     raw = raw.replace(",", "").replace(" ", "")
+    # INR crore
     m = re.search(r"₹([\d.]+)[Cc]r", raw)
     if m:
         return round(float(m.group(1)) * 1_00_00_000 / 84, 0)
+    # USD shorthand: $3M, $500K, $1B
     m = re.search(r"\$?([\d.]+)([BMKbmk]?)", raw)
     if m:
         n, s = float(m.group(1)), m.group(2).upper()
-        return n * {"B": 1e9, "M": 1e6, "K": 1e3}.get(s, 1)
+        multiplier = {"B": 1e9, "M": 1e6, "K": 1e3}.get(s, 1)
+        val = n * multiplier
+        return val if val > 0 else None
     return None
 
 
 def _split_investors(raw: str) -> list:
-    if not raw or raw.strip() in ("—", "-", "", "Undisclosed", "None", "nan"):
+    """'Sequoia, Blume / Accel' → ['Sequoia', 'Blume', 'Accel']"""
+    if not raw or raw.strip() in ("", "—", "-", "nan", "None", "Undisclosed"):
         return ["Undisclosed"]
-    return [p.strip() for p in re.split(r",\s*|\s+and\s+|\s*/\s*", raw) if p.strip()]
-
-
-def _normalise(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for col in ["startup_name", "domain", "investor", "round"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-    df["scraped_at"] = datetime.utcnow().strftime("%Y-%m-%d")
-    return df[df["startup_name"].str.len() > 1]
-
-
-def _dedup(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
-    # Fill NA before concat to silence FutureWarning
-    existing = existing.fillna("")
-    new = new.fillna("")
-    combined = pd.concat([existing, new], ignore_index=True)
-    return (combined
-            .drop_duplicates(subset=["startup_name", "investor", "round"], keep="last")
-            .sort_values(["domain", "startup_name"])
-            .reset_index(drop=True))
+    parts = re.split(r",\s*|\s*/\s*|\s+and\s+", raw)
+    cleaned = [p.strip() for p in parts if p.strip()]
+    return cleaned if cleaned else ["Undisclosed"]
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     log.info("=== India Funding Scraper starting ===")
-    all_rows = []
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    log.info("--- Source: StartupTalky ---")
-    all_rows.extend(scrape_startuptalky())
+    for year, url in STARTUPTALKY_URLS.items():
+        log.info(f"\n--- Year {year} ---")
 
-    log.info("--- Source: Inc42 ---")
-    all_rows.extend(scrape_inc42())
+        raw_df = scrape_year(year, url)
+        if raw_df.empty:
+            log.warning(f"No data scraped for {year}, skipping")
+            time.sleep(2)
+            continue
 
-    log.info("--- Source: Entrackr ---")
-    all_rows.extend(scrape_entrackr(max_articles=8))
+        clean_df = clean(raw_df, year)
+        if clean_df.empty:
+            log.warning(f"No clean rows for {year}, skipping")
+            time.sleep(2)
+            continue
 
-    if not all_rows:
-        log.warning("No rows scraped — exiting without writing")
-        return
+        csv_path = os.path.join(DATA_DIR, f"india_funding_{year}.csv")
+        final_df = merge_with_existing(clean_df, csv_path)
+        final_df.to_csv(csv_path, index=False)
+        log.info(f"  Saved {len(final_df)} rows → {csv_path}")
 
-    new_df = _normalise(pd.DataFrame(all_rows))
-    log.info(f"New rows scraped this run: {len(new_df)}")
+        time.sleep(2)   # be polite between year pages
 
-    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
-    if os.path.exists(OUTPUT_CSV):
-        existing_df = pd.read_csv(OUTPUT_CSV).fillna("")
-        log.info(f"Existing CSV rows: {len(existing_df)}")
-        final_df = _dedup(existing_df, new_df)
-    else:
-        final_df = new_df
-
-    final_df.to_csv(OUTPUT_CSV, index=False)
-    log.info(f"=== Done. {len(final_df)} total rows → {OUTPUT_CSV} ===")
+    log.info("\n=== Scraper done ===")
 
 
 if __name__ == "__main__":
