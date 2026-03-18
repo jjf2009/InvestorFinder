@@ -36,7 +36,8 @@ jobs:
           git config user.email "funding-bot@users.noreply.github.com"
           git add data/india_funding_2024.csv \
                   data/india_funding_2025.csv \
-                  data/india_funding_2026.csv
+                  data/india_funding_2026.csv \
+                  data/edtech_investors.csv
           if git diff --staged --quiet; then
             echo "No new data this week — nothing to commit"
           else
